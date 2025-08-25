@@ -5,9 +5,13 @@ from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
 from jaxtyping import Float, Int
 
+import multiprocessing as mp
 import numpy.typing as npt
 import torch
 from torch import Tensor
+
+from cs336_basics.pretokenization_example import find_chunk_boundaries
+from cs336_basics.tokenizer_utils import *
 
 
 def run_linear(
@@ -589,4 +593,83 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    with open(input_path, 'r', encoding='utf-8') as f:
+        str_full = f.read()
+
+    # Initial vocab
+    vocab = {i: bytes((i, )) for i in range(256)}
+    n = len(vocab)
+    for i, st in enumerate(special_tokens):
+        vocab[n + i] = st.encode('utf-8')
+
+    # Pretokeniazation
+    pretokenized_dict = {}
+    str_split = re.split('|'.join([re.escape(st) for st in special_tokens]), str_full)
+    for res in map(pretokenize, str_split):
+        for k, v in res.items():
+            upd_dic(tuple([s.encode('utf-8') for s in k]), v, pretokenized_dict)
+
+    # Pretokeniazation
+    # with open(input_path, 'rb') as fp:
+    #     pretokenized_dict, n_proc = {}, mp.cpu_count()
+    #     chunks = find_chunk_boundaries(fp, n_proc, split_special_token=bytes(special_tokens[0], 'utf-8'))
+    #
+    # with mp.Pool(n_proc) as pool:
+    #     for res in pool.starmap(pretokenize_mult, [(input_path, special_tokens, chunk) for chunk in zip(chunks[:-1], chunks[1:])]):
+    #         for k, v in res.items():
+    #             upd_dic(tuple([s.encode('utf-8') for s in k]), v, pretokenized_dict)
+
+    # Warm-up run
+    init_len = len(vocab)
+    pair_counts, to_join = {}, [[], 0]
+    for v, c in pretokenized_dict.items():
+        for bn in range(len(v)):
+            if bn < len(v) - 1:
+                pair = v[bn:bn + 2]
+                upd_dic(pair, c, pair_counts)
+                if pair_counts[pair] > to_join[1]:
+                    to_join = [[pair], pair_counts[pair]]
+                elif pair_counts[pair] == to_join[1]:
+                    to_join[0].append(pair)
+    new = sorted(to_join[0])[-1]
+
+    # Merging
+    merges = []
+    for i in range(init_len, vocab_size, 1):
+        vocab[i] = join_bytes(new)
+        merges.append(new)
+        # print(new, pretokenized_dict, '|||', pair_counts)
+        pair_counts.pop(new)
+        if len(pair_counts) == 0:
+            break
+
+        dict_upd = {}
+        for v, c in pretokenized_dict.items():
+            new_word, match, l = [], False, len(v)
+            for ii in range(l):
+                if v[ii:ii + 2] == new:
+                    match = True
+                    new_word.append(vocab[i])
+                    if ii - 1 >= 0:
+                        left = v[ii - 1:ii + 1]
+                        upd_dic(k=left, v=-c, dic=pair_counts)
+                        if pair_counts[left] == 0:
+                            pair_counts.pop(left)
+                        upd_dic(k=(v[ii - 1], vocab[i]), v=c, dic=pair_counts)
+                    if ii + 2 < l:
+                        right = v[ii + 1:ii + 3]
+                        upd_dic(k=right, v=-c, dic=pair_counts)
+                        if pair_counts[right] == 0:
+                            pair_counts.pop(right)
+                        upd_dic(k=(vocab[i], v[ii + 2]), v=c, dic=pair_counts)
+                elif match:
+                    match = False
+                else:
+                    new_word.append(v[ii])
+            dict_upd[tuple(new_word)] = c
+
+        pretokenized_dict = dict_upd
+        top_count = max(pair_counts.values())
+        new = sorted([pair for pair, count in pair_counts.items() if count == top_count])[-1]
+    return vocab, merges
